@@ -1,0 +1,149 @@
+import nmap
+import paramiko
+import time
+import os
+
+def print_colored(message, color):
+    """Imprime mensagens com cores."""
+    colors = {
+        'red': '\033[91m',
+        'green': '\033[92m',
+        'reset': '\033[0m',
+    }
+    print(f"{colors.get(color, colors['reset'])}{message}{colors['reset']}")
+
+def scan_range(ip_range, port):
+    """Escaneia a faixa de IPs para a porta específica e retorna IPs com a porta aberta."""
+    nm = nmap.PortScanner()
+    open_hosts = []
+
+    try:
+        nm.scan(hosts=ip_range, arguments=f'-T4 -p {port}')
+        for host in nm.all_hosts():
+            print(f'Host: {host} ({nm[host].hostname()})')
+            print(f'Estado: {nm[host].state()}')
+            for protocol in nm[host].all_protocols():
+                port_state = nm[host][protocol].get(int(port), {'state': 'closed or filtered'})
+                if port_state["state"] == 'open':
+                    open_hosts.append(host)
+                print(f'Port: {port}\tState: {port_state["state"]}')
+            print('-' * 60)
+    except nmap.PortScannerError as e:
+        print_colored(f'Erro do Nmap: {e}', 'red')
+    except Exception as e:
+        print_colored(f'Erro durante o escaneamento: {e}', 'red')
+    
+    return open_hosts
+
+def check_service_status(ssh, service_name):
+    """Verifica o status de um serviço no servidor remoto."""
+    try:
+        stdin, stdout, stderr = ssh.exec_command(f'systemctl is-active {service_name}')
+        status = stdout.read().decode().strip()
+        return status
+    except paramiko.SSHException as e:
+        print_colored(f'Erro ao verificar o status do serviço {service_name}: {e}', 'red')
+        return None
+
+def execute_commands(ssh, commands):
+    """Executa uma lista de comandos no servidor remoto."""
+    try:
+        for command in commands:
+            print(f'Executando comando: {command}')
+            stdin, stdout, stderr = ssh.exec_command(command)
+            exit_status = stdout.channel.recv_exit_status()
+            output = stdout.read().decode().strip()
+            error = stderr.read().decode().strip()
+            if output:
+                print(f'Saída: {output}')
+            if error:
+                print_colored(f'Erro: {error}', 'red')
+            if exit_status != 0:
+                print_colored(f'Comando "{command}" retornou o status {exit_status}', 'red')
+            time.sleep(10)  # Delay de 10 segundos entre os comandos
+    except paramiko.SSHException as e:
+        print_colored(f'Erro ao executar comandos: {e}', 'red')
+
+def check_lammps_installed(ssh):
+    """Verifica se o LAMMPS está instalado no servidor remoto."""
+    try:
+        stdin, stdout, stderr = ssh.exec_command('command -v lmp_serial')
+        lammps_installed = stdout.read().decode().strip()
+        return bool(lammps_installed)
+    except paramiko.SSHException as e:
+        print_colored(f'Erro ao verificar LAMMPS: {e}', 'red')
+        return False
+
+def manage_host(host, ssh_user, ssh_password, port, htcondor_commands, lammps_commands):
+    """Gerencia a instalação e configuração do HTCondor e LAMMPS em um host remoto."""
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(host, username=ssh_user, password=ssh_password, port=port)
+
+        # Verifica e instala HTCondor se necessário
+        htcondor_status = check_service_status(ssh, 'condor.service')
+        if htcondor_status == 'inactive' or htcondor_status is None:
+            print_colored(f'HTCondor não está ativo em {host}. Instalando e iniciando...', 'green')
+            execute_commands(ssh, htcondor_commands)
+        else:
+            print_colored(f'HTCondor já está ativo em {host}.', 'green')
+
+        # Verifica e instala LAMMPS se necessário
+        if not check_lammps_installed(ssh):
+            print_colored(f'LAMMPS não está instalado em {host}. Instalando...', 'green')
+            execute_commands(ssh, lammps_commands)
+        else:
+            print_colored(f'LAMMPS já está instalado em {host}.', 'green')
+
+        # Verifica a comunicação entre cliente e servidor HTCondor
+        print_colored('Verificando comunicação com o servidor HTCondor...', 'green')
+        stdin, stdout, stderr = ssh.exec_command('condor_status')
+        print(stdout.read().decode().strip())
+
+        # Copia arquivos e executa comandos adicionais
+        sftp = ssh.open_sftp()
+        sftp.put('lmp_serial', '/usr/local/bin/lmp_serial')
+        sftp.put('49-common.config', '/etc/condor/config.d/49-common.config')
+        sftp.close()
+
+        execute_commands(ssh, [
+            'apt-get install -y build-essential cmake git libfftw3-dev',
+            'systemctl restart condor.service'
+        ])
+
+        ssh.close()
+    except paramiko.SSHException as e:
+        print_colored(f'Erro SSH em {host}: {e}', 'red')
+    except Exception as e:
+        print_colored(f'Erro ao conectar em {host}: {e}', 'red')
+
+if __name__ == '__main__':
+    ip_range = '143.106.244.22'
+    port = 22000
+    ssh_user = 'root'
+    ssh_password = 'rmrs@)!('
+
+    # Comandos para instalar HTCondor
+    htcondor_commands = [
+        'apt update && apt upgrade -y',
+        'curl -fsSL https://get.htcondor.org | sudo GET_HTCONDOR_PASSWORD="htcondor_password" /bin/bash -s -- --no-dry-run --execute 143.106.243.252',
+        'systemctl enable condor.service',
+        'systemctl start condor.service',
+    ]
+  
+    # Comandos para instalar LAMMPS
+    lammps_commands = [
+        'apt-get update',
+        'apt-get install -y build-essential cmake git libfftw3-dev',
+        'git clone https://github.com/lammps/lammps.git',
+        'cd lammps/src && make yes-most && make -j 4 serial',
+        'cp lammps/src/lmp_serial /usr/local/bin/',
+        'echo "HAS_LAMMPS = True" | sudo tee -a /etc/condor/config.d/49-common.config',
+        'echo "STARTD_EXPRS = $(STARTD_EXPRS) HAS_LAMMPS" | sudo tee -a /etc/condor/config.d/49-common.config',
+        'systemctl restart condor.service',
+    ]
+
+    open_hosts = scan_range(ip_range, port)
+    for host in open_hosts:
+        manage_host(host, ssh_user, ssh_password, port, htcondor_commands, lammps_commands)
